@@ -1,30 +1,31 @@
-name: EmuELEC PES5 (aarch64, glibc 2.28)
+name: EmuELEC PES5 core (aarch64, glibc 2.28, sin ventana)
 
-# Etapa 1a: comprueba la cadena de compilacion para EmuELEC S905X3 y la caja, sin el juego.
-# Compila emuelec/gles_probe.cpp (SDL2 2.0.9 + GLES sobre la Mali) con un sysroot de Debian buster
-# (glibc 2.28), para que no pida simbolos mas nuevos que los de la caja (glibc 2.29, GLIBCXX 3.4.25).
-# Se lanza solo al subir cambios a la rama "emuelec" y tambien a mano (Actions -> Run workflow).
-# Basado en el emuelec-core.yml de CubeEvil4 (sysroot, envoltorios de clang, SDL2 de buster).
+# Etapa 1b-A: recompila default.xbe (en el runner, x86) y compila el juego recompilado para EmuELEC S905X3 (aarch64)
+# con el harness del SDK: backend nulo, audio nulo, sin ventana. Sirve para comprobar en la caja que el codigo
+# recompilado arranca y llega a dibujar fotogramas, antes de escribir el backend GLES.
+# REQUIERE assets/default.xbe en el repo: usa un repo PRIVADO (el xbe y el codigo recompilado son del juego de Konami).
+# Se lanza a mano: Actions -> "EmuELEC PES5 core" -> Run workflow (o al subir cambios a emuelec/headless).
 
 on:
   push:
     branches: [emuelec]
     paths:
-      - 'emuelec/**'
-      - '.github/workflows/emuelec-pes5.yml'
+      - 'emuelec/headless/**'
+      - 'emuelec/shim/**'
+      - '.github/workflows/emuelec-pes5-core.yml'
   workflow_dispatch:
 
 jobs:
-  probe:
+  core:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
 
       - name: Herramientas
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang lld cmake ninja-build python3 debootstrap binutils
+          sudo apt-get install -y clang lld cmake ninja-build python3 debootstrap binutils ccache
 
       - name: Sysroot Debian buster arm64
         run: |
@@ -113,73 +114,77 @@ jobs:
           set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
           EOF
 
-      - name: SDL2 de Debian buster (cabeceras y libreria para enlazar)
+      - name: Comprobar que esta el default.xbe
         run: |
-          # la caja usa SDL2 2.0.9: se compila contra las cabeceras de SDL2 2.0.9 de buster
-          base=http://archive.debian.org/debian/pool/main/libs/libsdl2
-          curl -fsSL "$base/" -o sdl_index.html
-          dev=$(grep -o 'libsdl2-dev_2\.0\.9[^"<>]*_arm64\.deb' sdl_index.html | sort -u | tail -1)
-          rt=$(grep -o 'libsdl2-2\.0-0_2\.0\.9[^"<>]*_arm64\.deb' sdl_index.html | sort -u | tail -1)
-          echo "paquetes: [$dev] [$rt]"
-          test -n "$dev"
-          test -n "$rt"
-          curl -fsSL -O "$base/$dev"
-          curl -fsSL -O "$base/$rt"
-          sudo mkdir -p /opt/sdl2dev
-          sudo dpkg-deb -x "$dev" /opt/sdl2dev
-          sudo dpkg-deb -x "$rt" /opt/sdl2dev
-          test -f /opt/sdl2dev/usr/include/SDL2/SDL.h
-          test -e /opt/sdl2dev/usr/lib/aarch64-linux-gnu/libSDL2-2.0.so.0
+          if [ ! -f assets/default.xbe ]; then
+            echo "::error::Falta assets/default.xbe en el repo. Sube tu default.xbe a assets/ en un repo PRIVADO."
+            exit 1
+          fi
+          ls -la assets/default.xbe
+          sha1sum assets/default.xbe
 
-      - name: Compilar la sonda SDL2 + GLES
+      - name: Codigo recompilado en cache
+        id: gen
+        uses: actions/cache@v4
+        with:
+          path: generated
+          key: gen-${{ hashFiles('assets/default.xbe', 'config/game.toml', 'sdk/tools/recomp/**', 'sdk/runtime/xdk/**') }}
+
+      - name: Recompilar default.xbe (x86, en el runner)
+        if: steps.gen.outputs.cache-hit != 'true'
         run: |
-          cmake -S emuelec -B build-emuelec -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/emuelec-aarch64.cmake" \
-            -DSDL2_ROOT=/opt/sdl2dev 2>&1 | tee configure.log
-          cmake --build build-emuelec -v 2>&1 | tee build.log
-          file build-emuelec/pes5_gles_probe
+          set -o pipefail
+          cmake -S tools/host -B out/host -G Ninja -DCMAKE_BUILD_TYPE=Release 2>&1 | tail -5
+          cmake --build out/host 2>&1 | tail -15
+          ./out/host/xbe_recomp config/game.toml --xdk sdk/xdk 2>&1 | tail -30
+          ls generated/game | head -5
+          ls generated/game | wc -l
+          test -f generated/game/x86_func_mapping.cpp
+          test -f generated/game/image_symbols.h
+
+      - name: Cache del compilador (ccache)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-core-${{ github.sha }}
+          restore-keys: ccache-core-
+
+      - name: Compilar el nucleo para aarch64 (harness sin ventana)
+        env:
+          CCACHE_COMPILERCHECK: content
+          CCACHE_MAXSIZE: 3G
+        run: |
+          set -o pipefail
+          export CXX="ccache /opt/wrap/clang++"
+          emuelec/headless/build_headless.sh . generated/game out-core 2>&1 | tee build.log
+          ccache -s | head -12
+          file out-core/pes5_core
 
       - name: Reunir resultado
         run: |
           mkdir -p out
-          cp build-emuelec/pes5_gles_probe out/
-          cat > out/probar.sh <<'EOF'
-          #!/bin/bash
-          # Prueba en la caja: copia esta carpeta a la caja y ejecuta este script (por SSH o desde Ports).
-          # Abre una ventana GLES, enseña lo que ofrece la Mali y dibuja un triangulo unos segundos.
-          # START del mando sale antes. Uso: ./probar.sh [segundos]
-          cd "$(dirname "$0")" || exit 1
-          chmod +x pes5_gles_probe probar.sh 2>/dev/null
-          {
-            echo "== fecha: $(date)"; uname -a; free -m | head -2
-            ./pes5_gles_probe "${1:-15}"; echo "codigo: $?"
-          } 2>&1 | tee probar.log
-          EOF
-          chmod +x out/probar.sh
+          cp out-core/pes5_core out/
+          strip --strip-unneeded out/pes5_core || true
           ls -la out
 
       - name: Comprobar versiones de glibc y libstdc++
         run: |
-          cd out
           echo "== GLIBC maximo pedido (la caja tiene 2.29) =="
-          readelf -Ws --dyn-syms pes5_gles_probe | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -3
+          readelf -Ws --dyn-syms out/pes5_core | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -3
           echo "== GLIBCXX maximo pedido (la caja llega a 3.4.25) =="
-          readelf -Ws --dyn-syms pes5_gles_probe | grep -o 'GLIBCXX_[0-9.]*' | sort -uV | tail -3 || true
+          readelf -Ws --dyn-syms out/pes5_core | grep -o 'GLIBCXX_[0-9.]*' | sort -uV | tail -3 || true
           echo "== librerias que pide =="
-          readelf -d pes5_gles_probe | grep -E "NEEDED|RUNPATH|RPATH" || true
+          readelf -d out/pes5_core | grep -E "NEEDED|RUNPATH|RPATH" || true
 
       - uses: actions/upload-artifact@v4
         with:
-          name: emuelec-pes5-probe-aarch64
+          name: emuelec-pes5-core-aarch64
           path: out/
           if-no-files-found: error
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: logs
-          path: |
-            configure.log
-            build.log
+          name: logs-core
+          path: build.log
           if-no-files-found: ignore
