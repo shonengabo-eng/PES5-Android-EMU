@@ -1,0 +1,185 @@
+name: EmuELEC PES5 (aarch64, glibc 2.28)
+
+# Etapa 1a: comprueba la cadena de compilacion para EmuELEC S905X3 y la caja, sin el juego.
+# Compila emuelec/gles_probe.cpp (SDL2 2.0.9 + GLES sobre la Mali) con un sysroot de Debian buster
+# (glibc 2.28), para que no pida simbolos mas nuevos que los de la caja (glibc 2.29, GLIBCXX 3.4.25).
+# Se lanza solo al subir cambios a la rama "emuelec" y tambien a mano (Actions -> Run workflow).
+# Basado en el emuelec-core.yml de CubeEvil4 (sysroot, envoltorios de clang, SDL2 de buster).
+
+on:
+  push:
+    branches: [emuelec]
+    paths:
+      - 'emuelec/**'
+      - '.github/workflows/emuelec-pes5.yml'
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Herramientas
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld cmake ninja-build python3 debootstrap binutils
+
+      - name: Sysroot Debian buster arm64
+        run: |
+          sudo debootstrap --foreign --no-check-gpg --variant=minbase --arch=arm64 \
+            --include=libc6-dev,libgcc-8-dev,libstdc++-8-dev,linux-libc-dev \
+            buster /opt/sysroot http://archive.debian.org/debian 2>&1 | tail -15
+          # --foreign solo desempaqueta la base: los .deb de --include se abren a mano
+          for d in /opt/sysroot/var/cache/apt/archives/*.deb; do
+            echo "desempaquetando $d"
+            sudo dpkg-deb -x "$d" /opt/sysroot
+          done
+          # enlaces absolutos (/lib/...) del sysroot -> relativos dentro del sysroot
+          sudo python3 - <<'PY'
+          import os
+          root = '/opt/sysroot'
+          n = 0
+          for dp, dn, fn in os.walk(root):
+              for name in dn + fn:
+                  p = os.path.join(dp, name)
+                  if not os.path.islink(p):
+                      continue
+                  t = os.readlink(p)
+                  if not os.path.isabs(t):
+                      continue
+                  tgt = os.path.join(root, t.lstrip('/'))
+                  rel = os.path.relpath(tgt, os.path.dirname(p))
+                  os.unlink(p)
+                  os.symlink(rel, p)
+                  n += 1
+          print('enlaces absolutos reescritos:', n)
+          PY
+          G=/opt/sysroot/usr/lib/gcc/aarch64-linux-gnu/8
+          sudo ln -sfn ../../../aarch64-linux-gnu/libgcc_s.so.1 "$G/libgcc_s.so"
+          sudo ln -sfn ../../../aarch64-linux-gnu/libstdc++.so.6 "$G/libstdc++.so"
+          L=/opt/sysroot/usr/lib/aarch64-linux-gnu
+          test -e "$G/libgcc_s.so"
+          test -e "$G/libstdc++.so"
+          test -e "$L/libm.so"
+          test -e "$L/libc.so"
+          test -f "$G/crtbegin.o"
+          test -f /opt/sysroot/usr/include/c++/8/string
+          test -f /opt/sysroot/usr/include/stdio.h
+          test -f "$L/crt1.o"
+
+      - name: Toolchain de CMake (con envoltorios de clang)
+        run: |
+          sudo mkdir -p /opt/wrap
+          sudo tee /opt/wrap/clang++ > /dev/null <<'EOF'
+          #!/bin/bash
+          S=/opt/sysroot
+          G=$S/usr/lib/gcc/aarch64-linux-gnu/8
+          extra=(--sysroot=$S -nostdinc++ -isystem $S/usr/include/c++/8 -isystem $S/usr/include/aarch64-linux-gnu/c++/8 -isystem $S/usr/include/c++/8/backward)
+          link=1
+          for a in "$@"; do
+            case "$a" in -c|-E|-S) link=0 ;; esac
+          done
+          tail=()
+          # glibc 2.28: pthread_*, dlopen y libm estan en libpthread/libdl/libm (no en libc)
+          if [ $link = 1 ]; then extra+=(-fuse-ld=lld -B$G -L$G); tail=(-lpthread -ldl -lm); fi
+          exec /usr/bin/clang++ "${extra[@]}" "$@" "${tail[@]}"
+          EOF
+          sudo tee /opt/wrap/clang > /dev/null <<'EOF'
+          #!/bin/bash
+          S=/opt/sysroot
+          G=$S/usr/lib/gcc/aarch64-linux-gnu/8
+          extra=(--sysroot=$S)
+          link=1
+          for a in "$@"; do
+            case "$a" in -c|-E|-S) link=0 ;; esac
+          done
+          tail=()
+          if [ $link = 1 ]; then extra+=(-fuse-ld=lld -B$G -L$G); tail=(-lpthread -ldl -lm); fi
+          exec /usr/bin/clang "${extra[@]}" "$@" "${tail[@]}"
+          EOF
+          sudo chmod +x /opt/wrap/clang /opt/wrap/clang++
+          cat > "$GITHUB_WORKSPACE/emuelec-aarch64.cmake" <<'EOF'
+          set(CMAKE_SYSTEM_NAME Linux)
+          set(CMAKE_SYSTEM_PROCESSOR aarch64)
+          set(CMAKE_C_COMPILER /opt/wrap/clang)
+          set(CMAKE_CXX_COMPILER /opt/wrap/clang++)
+          set(CMAKE_ASM_COMPILER /opt/wrap/clang)
+          set(CMAKE_C_COMPILER_TARGET aarch64-linux-gnu)
+          set(CMAKE_CXX_COMPILER_TARGET aarch64-linux-gnu)
+          set(CMAKE_ASM_COMPILER_TARGET aarch64-linux-gnu)
+          set(CMAKE_FIND_ROOT_PATH /opt/sysroot)
+          set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+          EOF
+
+      - name: SDL2 de Debian buster (cabeceras y libreria para enlazar)
+        run: |
+          # la caja usa SDL2 2.0.9: se compila contra las cabeceras de SDL2 2.0.9 de buster
+          base=http://archive.debian.org/debian/pool/main/libs/libsdl2
+          curl -fsSL "$base/" -o sdl_index.html
+          dev=$(grep -o 'libsdl2-dev_2\.0\.9[^"<>]*_arm64\.deb' sdl_index.html | sort -u | tail -1)
+          rt=$(grep -o 'libsdl2-2\.0-0_2\.0\.9[^"<>]*_arm64\.deb' sdl_index.html | sort -u | tail -1)
+          echo "paquetes: [$dev] [$rt]"
+          test -n "$dev"
+          test -n "$rt"
+          curl -fsSL -O "$base/$dev"
+          curl -fsSL -O "$base/$rt"
+          sudo mkdir -p /opt/sdl2dev
+          sudo dpkg-deb -x "$dev" /opt/sdl2dev
+          sudo dpkg-deb -x "$rt" /opt/sdl2dev
+          test -f /opt/sdl2dev/usr/include/SDL2/SDL.h
+          test -e /opt/sdl2dev/usr/lib/aarch64-linux-gnu/libSDL2-2.0.so.0
+
+      - name: Compilar la sonda SDL2 + GLES
+        run: |
+          cmake -S emuelec -B build-emuelec -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/emuelec-aarch64.cmake" \
+            -DSDL2_ROOT=/opt/sdl2dev 2>&1 | tee configure.log
+          cmake --build build-emuelec -v 2>&1 | tee build.log
+          file build-emuelec/pes5_gles_probe
+
+      - name: Reunir resultado
+        run: |
+          mkdir -p out
+          cp build-emuelec/pes5_gles_probe out/
+          cat > out/probar.sh <<'EOF'
+          #!/bin/bash
+          # Prueba en la caja: copia esta carpeta a la caja y ejecuta este script (por SSH o desde Ports).
+          # Abre una ventana GLES, enseña lo que ofrece la Mali y dibuja un triangulo unos segundos.
+          # START del mando sale antes. Uso: ./probar.sh [segundos]
+          cd "$(dirname "$0")" || exit 1
+          chmod +x pes5_gles_probe probar.sh 2>/dev/null
+          {
+            echo "== fecha: $(date)"; uname -a; free -m | head -2
+            ./pes5_gles_probe "${1:-15}"; echo "codigo: $?"
+          } 2>&1 | tee probar.log
+          EOF
+          chmod +x out/probar.sh
+          ls -la out
+
+      - name: Comprobar versiones de glibc y libstdc++
+        run: |
+          cd out
+          echo "== GLIBC maximo pedido (la caja tiene 2.29) =="
+          readelf -Ws --dyn-syms pes5_gles_probe | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -3
+          echo "== GLIBCXX maximo pedido (la caja llega a 3.4.25) =="
+          readelf -Ws --dyn-syms pes5_gles_probe | grep -o 'GLIBCXX_[0-9.]*' | sort -uV | tail -3 || true
+          echo "== librerias que pide =="
+          readelf -d pes5_gles_probe | grep -E "NEEDED|RUNPATH|RPATH" || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: emuelec-pes5-probe-aarch64
+          path: out/
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs
+          path: |
+            configure.log
+            build.log
+          if-no-files-found: ignore
